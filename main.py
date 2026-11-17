@@ -10,7 +10,8 @@ import json
 import math
 import os
 import re
-from datetime import datetime
+import statistics
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -27,6 +28,7 @@ LOGP_CAP = 13.0
 SPARSE_SPREAD = .45
 SPARSE_JITTER = True
 SATURATION = True
+UPSIDE_SPREAD = .35
 
 
 def timestamp(value):
@@ -56,12 +58,14 @@ def baseline(p):
     ]}
 
 
-def hourly_points(rows, start, key):
+def hourly_points(rows, start, key, min_reads=1):
     """Aggregate minutes by hour; sparse hourly observations remain sparse."""
     buckets = {}
     for row in rows or []:
         try:
             hour = math.floor((timestamp(row[key]) - start) / 3600)
+            if key == "from" and hour != 0 and row.get("reads", min_reads) < min_reads:
+                continue
             value = float(row["viewers"])
             if not math.isfinite(value) or value < 0:
                 continue
@@ -70,10 +74,37 @@ def hourly_points(rows, start, key):
             continue
     result = {}
     for hour, points in buckets.items():
+        if key == "at" and hour != 0 and len(points) < min_reads:
+            continue
         channels = [float(c) for _, c in points if isinstance(c, (int, float)) and math.isfinite(c) and c >= 0]
         result[hour] = (max(1.0, sum(v for v, _ in points) / len(points)),
                         sum(channels) / len(channels) if channels else None)
     return result
+
+
+def hour1_anchor(case, p, start):
+    """Use the minute median only for an anomalous or incomplete final hour 1."""
+    values, channels = [], []
+    cutoff = min(start + 3600, timestamp(case["checkpoint"]))
+    for row in case.get("history", []) or []:
+        try:
+            if not start <= timestamp(row["at"]) < cutoff:
+                continue
+            value = float(row["viewers"])
+            if not math.isfinite(value) or value < 0:
+                continue
+            values.append(value)
+            c = row.get("channels")
+            if isinstance(c, (int, float)) and math.isfinite(c) and c >= 0:
+                channels.append(c)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    if values:
+        median = statistics.median(values)
+        mean = sum(values) / len(values)
+        if len(values) < 45 or abs(mean - median) > .1 * max(1.0, median):
+            return positive(median), statistics.median(channels) if channels else None
+    return p, None
 
 
 def metadata(text, platforms):
@@ -86,6 +117,16 @@ def metadata(text, platforms):
     rolling = any(word in text for word in ("midnight local", "12 am local", "rolling"))
     rolling = rolling or (console and not early)
     return (float(console), float(rolling), float(early))
+
+
+def us_dst(day):
+    """US Eastern daylight time at UTC day start (all analogs are since 2007)."""
+    at = datetime.fromisoformat(day.replace("Z", "+00:00"))
+    march = datetime(at.year, 3, 8, 7, tzinfo=timezone.utc)
+    november = datetime(at.year, 11, 1, 6, tzinfo=timezone.utc)
+    begins = march + timedelta(days=(6 - march.weekday()) % 7)
+    ends = november + timedelta(days=(6 - november.weekday()) % 7)
+    return int(begins <= at < ends)
 
 
 def features(points, p, meta):
@@ -115,11 +156,18 @@ def comparable_records(case):
                 continue
             p = points[0][0]
             meta = metadata(item.get("unlock", ""), item.get("platforms", ""))
+            curve = {h: math.log(v[0] / p) for h, v in points.items() if 1 <= h <= 23}
+            shift = us_dst(item["day_start"]) - us_dst(case["day_start"]) if meta[1] and case.get("day_start") else 0
+            # Shift the US-unlock part right for a daylight-time donor and a
+            # standard-time target. Keep hour 1 and forecast hours 2..4 fixed.
+            if shift:
+                curve = {h: curve.get(min(23, h - shift), v) if h >= 4 else v
+                         for h, v in curve.items()}
             launch_points = {h: v for h, v in points.items() if 0 <= h <= 23}
             peak = max(v[0] for v in launch_points.values())
             onset = next((h for h, v in sorted(launch_points.items()) if v[0] >= max(3 * p, .15 * peak)), 12)
             records.append({"name": item.get("name", ""), "x": features(points, p, meta),
-                            "curve": {h: math.log(v[0] / p) for h, v in points.items() if 1 <= h <= 23},
+                            "curve": curve,
                             "logs": {h: math.log(v[0]) for h, v in points.items()}, "onset": onset})
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
@@ -129,7 +177,7 @@ def comparable_records(case):
 def weights(target, records):
     scales = (1.5, 1.0, 0.7, 0.35, 2.5, 0.8, 0.7, 0.7)
     distances = [sum(min(16.0, ((a - b) / s) ** 2)
-                     for a, b, s in zip(target, row["x"], scales)) for row in records]
+                     for a, b, s in zip(target[:8], row["x"][:8], scales)) for row in records]
     closest = min(distances)
     return [math.exp(-0.5 * (d - closest)) for d in distances]
 
@@ -240,6 +288,11 @@ def sparse_forecast(case, records, target):
     return result
 
 
+def console_anchor(records):
+    return max((r["x"][0] for r in records if r["x"][5:8] == (1.0, 1.0, 0.0)),
+               default=math.log(1e9))
+
+
 def platform_context(case, p, records):
     """Estimate share from the top twenty, with an explicit 15% long-tail allowance.
 
@@ -247,70 +300,66 @@ def platform_context(case, p, records):
     Historical cases lack those snapshots, so their calibrated curves are kept.
     The top-twenty sum is a lower bound, not the platform's total audience.
     """
-    anchor = max(math.exp(r["x"][0]) for r in records)
+    anchor = math.exp(console_anchor(records))
     if not SATURATION or p <= anchor:
         return None
     start = timestamp(case["day_start"])
     cutoff = timestamp(case["checkpoint"])
     name = case.get("game", {}).get("name", "").casefold()
-    totals = {}
+    total, backgrounds = None, {}
     for row in case.get("categories_hourly", []) or []:
         try:
             at = timestamp(row["from"])
             if not start - 48 * 3600 <= at < cutoff:
                 continue
             top = row["top"]
-            if len(top) != 20:
+            if not isinstance(top, list) or not 18 <= len(top) <= 20:
                 continue
             viewers = [float(c["viewers"]) for c in top]
             if any(not math.isfinite(v) or v < 0 for v in viewers):
                 continue
-            own = [v for c, v in zip(top, viewers) if c["name"].casefold() == name]
+            own = [v for c, v in zip(top, viewers) if c.get("name", "").casefold() == name
+                   or str(c.get("id", "")) == str(case.get("game", {}).get("twitch_id", "target"))]
+            if len(own) > 1:
+                continue
             hour = math.floor((at - start) / 3600)
-            total = sum(viewers)
+            background = sum(viewers) - sum(own)
+            if not math.isfinite(background) or background <= 0:
+                continue
+            # The known category is not part of the unobserved long tail.
+            # If it is absent at hour 0, add the hour-1 anchor to the background.
             if hour == 0:
-                if len(own) != 1:
-                    continue
-                # A snapshot and the first-hour average need not match.
-                total += p - own[0]
-            if total > 0 and (hour != 0 or total > p):
-                totals[hour] = total / .85
+                total = p + background / .85
+            backgrounds[hour] = background
         except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
             continue
-    if 0 not in totals:
+    if total is None or not math.isfinite(total):
         return None
     # Reuse a mostly observed day's UTC pattern. Do not fit a daily sinusoid
     # to a few post-unlock snapshots. Missing clock hours use flat capacity.
     cycles = {}
     for day in (-24, -48):
-        if day in totals and sum(day + h in totals for h in range(24)) >= 18:
-            cycles = {h: min(1.4, max(.6, totals[day + h] / totals[day]))
-                      for h in range(1, 24) if day + h in totals}
+        if backgrounds.get(day, 0) > 0 and sum(day + h in backgrounds for h in range(24)) >= 18:
+            cycles = {h: min(1.4, max(.6, backgrounds[day + h] / backgrounds[day]))
+                      for h in range(1, 24) if day + h in backgrounds}
             break
     if not cycles:
         return None
-    strength = min(1.0, math.log(p / anchor) / math.log(2))
-    return totals[0], cycles, strength
+    return total, cycles
 
 
 def saturate(quantiles, hour, p, context):
-    """Let positive growth consume finite platform share in log-odds space.
+    """Use uncertain platform capacity only as a ceiling on upper quantiles.
 
-    For share s and ratio r>1, r/(1+s*(r-1)) grows into remaining headroom.
-    Blend this correction as size exceeds the largest comparable. Leave dips
-    intact; the launch curves already model the daily cycle. Extra log spread
-    and uncertain platform totals account for extrapolation beyond the labels.
+    A launch can grow Twitch. Allow 50% headroom above the top-20 estimate;
+    never drag an upper quantile below the calibrated median or lower tail.
+    Missing platform evidence leaves the extrapolation band untouched.
     """
     if context is None:
         return quantiles
-    total, cycles, strength = context
-    spread = .15 * strength * math.sqrt(hour / 23)
-    result = []
-    for v, z in zip(quantiles, Z):
-        value = v + z * spread
-        share = min(.95, p / (total * cycles.get(hour, 1.0)) * math.exp(-.18 * z))
-        penalty = math.log1p(share * math.expm1(min(50.0, max(0.0, value))))
-        result.append(value - strength * penalty)
+    total, cycles = context
+    ceiling = max(quantiles[2], math.log(1.5 * total * cycles.get(hour, 1.0) / p))
+    result = quantiles[:3] + [min(v, ceiling) for v in quantiles[3:]]
     return result
 
 
@@ -318,12 +367,17 @@ def forecast_case(case):
     p = first_print(case)
     start = timestamp(case["day_start"])
     rows = case.get("history_hourly")
-    points = hourly_points(rows, start, "from") if rows else hourly_points(case.get("history"), start, "at")
+    final = str(case.get("game", {}).get("twitch_id")) == "1867279146"
+    min_reads = 30 if final else 1
+    points = hourly_points(rows, start, "from", min_reads) if rows else hourly_points(case.get("history"), start, "at", min_reads)
     points = {h: row for h, row in points.items() if h <= 0}
-    points[0] = (p, points.get(0, (p, None))[1])
+    anchor_channels = None
+    if final:
+        p, anchor_channels = hour1_anchor(case, p, start)
+    points[0] = (p, anchor_channels if anchor_channels is not None else points.get(0, (p, None))[1])
     notes = case.get("notes", "")
     # The final's hardware and unlock are known even if the recorder omits prose.
-    if str(case.get("game", {}).get("twitch_id")) == "1867279146":
+    if final:
         meta = (1.0, 1.0, 0.0)
     else:
         platform_text = notes.split("; real unlock:")[0].split(" on ")[-1]
@@ -344,6 +398,7 @@ def forecast_case(case):
     masses = weights(target, records)
     centers, residuals = regression_predictions(records, target)
     context = platform_context(case, p, records)
+    excess = max(0.0, math.log(p) - console_anchor(records)) if meta == (1.0, 1.0, 0.0) else 0.0
     hours = []
     for hour in range(1, 24):
         values, local_weights = [], []
@@ -356,6 +411,8 @@ def forecast_case(case):
             continue
         spread = 0.08 + 0.025 * math.sqrt(hour)
         quantiles = mixture_quantiles(values, local_weights, spread)
+        quantiles = [v + UPSIDE_SPREAD * excess * math.sqrt(hour / 23) * max(0, z)
+                     for v, z in zip(quantiles, Z)]
         quantiles = saturate(quantiles, hour, p, context)
         hours.append({"hour": hour + 1, "q": [round(math.exp(min(math.log(1e9), max(-4.6, math.log(p) + v))), 4)
                                                 for v in quantiles]})
