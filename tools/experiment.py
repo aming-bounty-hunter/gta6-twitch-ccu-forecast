@@ -22,7 +22,7 @@ spec.loader.exec_module(entry)
 
 
 def evaluate(practices, launches, answers):
-    prows, loo, like = [], [], []
+    prows, loo, like, coverage, like_coverage = [], [], [], [], []
     for case in practices:
         prediction = backtest.validate(json.dumps(entry.forecast_case(case)).encode())
         prows.append(backtest.score(prediction, answers[case["id"]])["loss"])
@@ -34,11 +34,15 @@ def evaluate(practices, launches, answers):
             continue
         case, truth = pair
         prediction = backtest.validate(json.dumps(entry.forecast_case(case)).encode())
-        loss = backtest.score(prediction, truth)["loss"]
+        scores = backtest.score(prediction, truth)
+        loss = scores["loss"]
         loo.append(loss)
+        coverage.append(scores["coverage"])
         if backtest.gta_like(launch):
             like.append(loss)
-    return prows, sum(loo) / len(loo), sum(like) / len(like)
+            like_coverage.append(scores["coverage"])
+    return (prows, sum(loo) / len(loo), sum(like) / len(like),
+            sum(coverage) / len(coverage), sum(like_coverage) / len(like_coverage))
 
 
 def main():
@@ -46,10 +50,12 @@ def main():
     parser.add_argument("--structural", action="store_true")
     parser.add_argument("--activity", action="store_true")
     parser.add_argument("--sparse", action="store_true")
+    parser.add_argument("--calibration", action="store_true")
+    parser.add_argument("--answers", type=Path, default=ROOT.parent / "evidence/gta-practice-answers.json")
     args = parser.parse_args()
     kit = ROOT.parent / "gta6-twitch-ccu-forecast-01-kit"
     practices = [json.loads(p.read_text()) for p in sorted((kit / "input").glob("p*.in"))]
-    answers = backtest.load_answers(Path("/tmp/gta-practice-answers.json"))
+    answers = backtest.load_answers(args.answers)
     launches = practices[0]["comparables"]
     variants = [
         ("base pooled wide", "base", False, 3.0, .50, 1.00),
@@ -88,7 +94,10 @@ def main():
     if args.sparse:
         variants = [(f"sparse s{spread} j{int(jitter)}", "activity", False, 3.0, .25, .85, 13.0, spread, jitter)
                     for spread, jitter in ((.25, False), (.45, False), (.25, True), (.45, True), (.65, True))]
-    print("variant                    p00     p01     p02     p03    Pmean  LOOall LOOlike", flush=True)
+    if args.calibration:
+        variants = [(f"residual scale {scale}", "activity", False, 3.0, .25, scale, 13.0, .45, True)
+                    for scale in (.85, .90, .95, 1.0)]
+    print("variant                    p00     p01     p02     p03    Pmean  LOOall LOOlike CoverAll CoverLike", flush=True)
     for variant in variants:
         name, feature, regime, ridge, pool, scale = variant[:6]
         entry.LOGP_CAP = variant[6] if len(variant) > 6 else float("inf")
@@ -97,9 +106,10 @@ def main():
         entry.FEATURE_SET, entry.REGIME, entry.RIDGE = feature, regime, ridge
         entry.RESIDUAL_POOL, entry.RESIDUAL_SCALE = pool, scale
         started = time.perf_counter()
-        prows, all_loss, like_loss = evaluate(practices, launches, answers)
+        prows, all_loss, like_loss, coverage, like_coverage = evaluate(practices, launches, answers)
         print(f"{name:26}" + "".join(f" {x:.4f}" for x in prows) +
-              f" {sum(prows)/4:.4f} {all_loss:.4f} {like_loss:.4f} ({time.perf_counter()-started:.1f}s)", flush=True)
+              f" {sum(prows)/4:.4f} {all_loss:.4f} {like_loss:.4f} {coverage:.3f} {like_coverage:.3f}"
+              f" ({time.perf_counter()-started:.1f}s)", flush=True)
     prows = [backtest.score(backtest.persistence(c["known"][0]["viewers"]), answers[c["id"]])["loss"]
              for c in practices]
     rows, like = [], []

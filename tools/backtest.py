@@ -345,7 +345,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kit", type=Path, default=ROOT.parent / "gta6-twitch-ccu-forecast-01-kit")
     parser.add_argument("--entry", type=Path, default=ROOT / "main.py")
-    parser.add_argument("--answers", type=Path, help="labels from fetch_practice.py (default: its /tmp cache)")
+    parser.add_argument("--answers", type=Path, default=ROOT.parent / "evidence/gta-practice-answers.json",
+                        help="cached practice labels (default: ../evidence/gta-practice-answers.json)")
     parser.add_argument("--details", action="store_true")
     parser.add_argument("--report", type=Path, help="optional JSON results; keep outside the repo")
     args = parser.parse_args()
@@ -354,8 +355,6 @@ def main():
     if len(practices) != 4:
         raise ValueError("expected four practice cases")
     answer_path = args.answers
-    if answer_path is None and Path("/tmp/gta-practice-answers.json").is_file():
-        answer_path = Path("/tmp/gta-practice-answers.json")
     answers = load_answers(answer_path)
     launches = practices[0]["comparables"]
     press_checked = args.entry.resolve() == (ROOT / "main.py").resolve()

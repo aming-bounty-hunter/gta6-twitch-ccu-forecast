@@ -2,8 +2,8 @@
 
 Features use only pre-checkpoint observations. Quantile residuals are computed
 by leave-one-out within the supplied training pool; the benchmark holds out an
-additional entire launch. Streams and category ranks have no historical labels,
-so they are accepted without inventing a forecasting effect for them.
+additional entire launch. Category totals constrain upside only beyond the
+observed launch sizes. Streams have no historical snapshots and are unused.
 """
 
 import json
@@ -26,6 +26,7 @@ SPARSE_MODE = True
 LOGP_CAP = 13.0
 SPARSE_SPREAD = .45
 SPARSE_JITTER = True
+SATURATION = True
 
 
 def timestamp(value):
@@ -239,6 +240,80 @@ def sparse_forecast(case, records, target):
     return result
 
 
+def platform_context(case, p, records):
+    """Estimate share from the top twenty, with an explicit 15% long-tail allowance.
+
+    This guard needs an unprecedented hour 1 AND observed platform snapshots.
+    Historical cases lack those snapshots, so their calibrated curves are kept.
+    The top-twenty sum is a lower bound, not the platform's total audience.
+    """
+    anchor = max(math.exp(r["x"][0]) for r in records)
+    if not SATURATION or p <= anchor:
+        return None
+    start = timestamp(case["day_start"])
+    cutoff = timestamp(case["checkpoint"])
+    name = case.get("game", {}).get("name", "").casefold()
+    totals = {}
+    for row in case.get("categories_hourly", []) or []:
+        try:
+            at = timestamp(row["from"])
+            if not start - 48 * 3600 <= at < cutoff:
+                continue
+            top = row["top"]
+            if len(top) != 20:
+                continue
+            viewers = [float(c["viewers"]) for c in top]
+            if any(not math.isfinite(v) or v < 0 for v in viewers):
+                continue
+            own = [v for c, v in zip(top, viewers) if c["name"].casefold() == name]
+            hour = math.floor((at - start) / 3600)
+            total = sum(viewers)
+            if hour == 0:
+                if len(own) != 1:
+                    continue
+                # A snapshot and the first-hour average need not match.
+                total += p - own[0]
+            if total > 0 and (hour != 0 or total > p):
+                totals[hour] = total / .85
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+            continue
+    if 0 not in totals:
+        return None
+    # Reuse a mostly observed day's UTC pattern. Do not fit a daily sinusoid
+    # to a few post-unlock snapshots. Missing clock hours use flat capacity.
+    cycles = {}
+    for day in (-24, -48):
+        if day in totals and sum(day + h in totals for h in range(24)) >= 18:
+            cycles = {h: min(1.4, max(.6, totals[day + h] / totals[day]))
+                      for h in range(1, 24) if day + h in totals}
+            break
+    if not cycles:
+        return None
+    strength = min(1.0, math.log(p / anchor) / math.log(2))
+    return totals[0], cycles, strength
+
+
+def saturate(quantiles, hour, p, context):
+    """Let positive growth consume finite platform share in log-odds space.
+
+    For share s and ratio r>1, r/(1+s*(r-1)) grows into remaining headroom.
+    Blend this correction as size exceeds the largest comparable. Leave dips
+    intact; the launch curves already model the daily cycle. Extra log spread
+    and uncertain platform totals account for extrapolation beyond the labels.
+    """
+    if context is None:
+        return quantiles
+    total, cycles, strength = context
+    spread = .15 * strength * math.sqrt(hour / 23)
+    result = []
+    for v, z in zip(quantiles, Z):
+        value = v + z * spread
+        share = min(.95, p / (total * cycles.get(hour, 1.0)) * math.exp(-.18 * z))
+        penalty = math.log1p(share * math.expm1(min(50.0, max(0.0, value))))
+        result.append(value - strength * penalty)
+    return result
+
+
 def forecast_case(case):
     p = first_print(case)
     start = timestamp(case["day_start"])
@@ -268,6 +343,7 @@ def forecast_case(case):
                                                       for v in row]} for h, row in enumerate(sparse)]}
     masses = weights(target, records)
     centers, residuals = regression_predictions(records, target)
+    context = platform_context(case, p, records)
     hours = []
     for hour in range(1, 24):
         values, local_weights = [], []
@@ -280,6 +356,7 @@ def forecast_case(case):
             continue
         spread = 0.08 + 0.025 * math.sqrt(hour)
         quantiles = mixture_quantiles(values, local_weights, spread)
+        quantiles = saturate(quantiles, hour, p, context)
         hours.append({"hour": hour + 1, "q": [round(math.exp(min(math.log(1e9), max(-4.6, math.log(p) + v))), 4)
                                                 for v in quantiles]})
     return {"hours": hours}
