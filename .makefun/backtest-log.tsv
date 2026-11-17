@@ -1,0 +1,7 @@
+trial	change	p00	p01	p02	p03	practice_mean	loo_37	rolling_11
+1	weighted analog log-ratios	0.319335	0.143314	0.171884	0.217871	0.213101	0.453010	0.313623
+2	ridge curves and nested LOO residuals	0.226302	0.174868	0.151034	0.188165	0.185092	0.390448	0.224780
+3	channel features and separate activity pools; rejected	0.267722	0.138819	0.129625	0.174681	0.177712	0.440295	0.232379
+4	pooled fit and aligned cold-start donors	0.212616	0.148234	0.123752	0.168359	0.163240	0.359629	0.216781
+5	activity indicator; saturated size effect; cold-start timing uncertainty; selected	0.220451	0.139075	0.120206	0.168232	0.161991	0.347345	0.236456
+baseline	house persistence	0.743671	0.286813	0.214579	0.303324	0.387097	0.929650	0.363046

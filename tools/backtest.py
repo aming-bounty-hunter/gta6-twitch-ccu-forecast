@@ -7,6 +7,7 @@ replaced with a guess. All synthetic files live in a temporary directory.
 
 import argparse
 import copy
+import importlib.util
 import json
 import math
 import os
@@ -80,7 +81,7 @@ def score(forecast, truth):
             "coverage": statistics.mean(covers), "n": len(truth)}
 
 
-def run_entry(case, temp, entry):
+def run_entry(case, temp, entry, raw=None):
     input_dir, output_dir = temp / "input", temp / "output"
     input_dir.mkdir(exist_ok=True)
     output_dir.mkdir(exist_ok=True)
@@ -89,7 +90,16 @@ def run_entry(case, temp, entry):
     for path in output_dir.glob("*.out"):
         path.unlink()
     case_id = case["id"]
-    (input_dir / (case_id + ".in")).write_text(json.dumps(case), encoding="utf-8")
+    (input_dir / (case_id + ".in")).write_text(json.dumps(case) if raw is None else raw, encoding="utf-8")
+    elapsed = invoke_entry(input_dir, output_dir, entry)
+    output = output_dir / (case_id + ".out")
+    if output.is_symlink() or not output.is_file():
+        raise ValueError("missing regular output file")
+    data = output.read_bytes()
+    return validate(data), elapsed, data
+
+
+def invoke_entry(input_dir, output_dir, entry):
     env = dict(os.environ, MAKEFUN_INPUT_DIR=str(input_dir), MAKEFUN_OUTPUT_DIR=str(output_dir), PYTHONHASHSEED="0")
     started = time.perf_counter()
     process = subprocess.run([sys.executable, "-P", "-s", str(entry)], env=env,
@@ -97,11 +107,19 @@ def run_entry(case, temp, entry):
     elapsed = time.perf_counter() - started
     if process.returncode:
         raise ValueError(f"entry exit {process.returncode}: {process.stderr.decode()[:500]}")
-    output = output_dir / (case_id + ".out")
-    if output.is_symlink() or not output.is_file():
-        raise ValueError("missing regular output file")
-    data = output.read_bytes()
-    return validate(data), elapsed, data
+    return elapsed
+
+
+def grade_entry(case, temp, entry):
+    """An invalid execution gets flat hour-1 quantiles, as the contest specifies."""
+    started = time.perf_counter()
+    try:
+        pred, elapsed, data = run_entry(case, temp, entry)
+        return pred, elapsed, data, True, None
+    except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+        p = max(1, case["known"][0]["viewers"])
+        pred = {h: [p] * 5 for h in range(2, 25)}
+        return pred, time.perf_counter() - started, None, False, str(error)
 
 
 def is_target_history(launch):
@@ -116,6 +134,11 @@ def gta_like(launch):
     return ("midnight local" in text or "12 am local" in text or "rolling" in text) and (
         any(k in platforms for k in ("ps", "xbox", "switch"))) and (
         "early-access-contaminated" not in text)
+
+
+def console_only(launch):
+    platforms = launch.get("platforms", "").lower().split("(")[0]
+    return "pc" not in platforms and "stadia" not in platforms
 
 
 def synthesize(launch, comparables, case_id):
@@ -146,18 +169,38 @@ def synthesize(launch, comparables, case_id):
     return case, truth
 
 
-def final_shape(practices, launches):
+def final_shape(practices, launches, answers):
     case = copy.deepcopy(practices[0])
     case["id"] = "final_shape"
     case["game"] = {"name": "Grand Theft Auto VI", "twitch_id": "1867279146"}
     case["notes"] = "PS5 and Xbox Series; rolling midnight local. US east 05:00Z, west 08:00Z."
     case["comparables"] = list(launches)
-    # Add the four practice histories as incomplete analogs, as in a larger final pool.
+    # The real final adds these four launches to its training pool. Use the
+    # independently fetched labels, when available, to exercise all 41 donors.
     for practice in practices:
+        hourly = [{"from": p["at"], "viewers": p["viewers"], "channels": p.get("channels")}
+                  for p in practice["history"]]
+        start = instant(practice["day_start"])
+        hourly.extend({"from": iso(start + timedelta(hours=h - 1)), "viewers": y, "channels": None}
+                      for h, y in answers.get(practice["id"], {}).items())
         case["comparables"].append({"name": practice["game"]["name"], "day_start": practice["day_start"],
             "platforms": "PS5, Xbox", "unlock": practice["notes"],
-            "hourly": [{"from": p["at"], "viewers": p["viewers"], "channels": p.get("channels")}
-                       for p in practice["history"]]})
+            "hourly": hourly})
+    shift = instant("2026-11-19T00:00:00Z") - instant(case["day_start"])
+    case["day_start"] = iso(instant(case["day_start"]) + shift)
+    case["checkpoint"] = iso(instant(case["checkpoint"]) + shift)
+    for row in case["known"] + case["forecast"]:
+        row["from"] = iso(instant(row["from"]) + shift)
+        row["until"] = iso(instant(row["until"]) + shift)
+        if "viewers" in row:
+            row["viewers"] *= 80
+        if row.get("channels") is not None:
+            row["channels"] *= 20
+    for row in case["history_hourly"]:
+        row["from"] = iso(instant(row["from"]) + shift)
+        row["viewers"] *= 80
+        if row.get("channels") is not None:
+            row["channels"] *= 20
     history = []
     cutoff = instant(case["checkpoint"]) - timedelta(hours=48)
     for row in case["history_hourly"]:
@@ -165,13 +208,17 @@ def final_shape(practices, launches):
         if t < cutoff:
             continue
         for minute in range(60):
-            history.append({"at": iso(t + timedelta(minutes=minute)), "viewers": row["viewers"],
+            # Symmetric integer changes keep the exact hourly mean unchanged.
+            step = int(row["viewers"] // 1000)
+            history.append({"at": iso(t + timedelta(minutes=minute)),
+                            "viewers": row["viewers"] + step * (2 * minute - 59),
                             "channels": row.get("channels")})
         row["reads"] = 60
     case["history"] = history
     case["history_hourly"] = [r for r in case["history_hourly"] if instant(r["from"]) >= cutoff]
     case["known"][0]["reads"] = 60
-    case["streams"] = [{"login": f"stream{i:02}", "viewers": max(1, 10000 // (i + 1)),
+    p1 = case["known"][0]["viewers"]
+    case["streams"] = [{"login": f"stream{i:02}", "viewers": max(1, int(.18 * p1 / (i + 1))),
                         "language": ("en", "de", "es", "ja")[i % 4],
                         "started_at": iso(instant(case["day_start"]) - timedelta(hours=4))} for i in range(20)]
     case["categories_hourly"] = [{"from": r["from"], "top": [
@@ -238,11 +285,67 @@ def self_check():
         validate(json.dumps(altered).encode()), {2: 1000000, 3: 700000})
 
 
+def check_press(entry, launches):
+    """Compare analytic calibration residuals with literal held-out refitting."""
+    spec = importlib.util.spec_from_file_location("checked_entry", entry)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    records = module.comparable_records({"comparables": launches})[:9]
+    _, errors = module.fit_regression(records)
+    index = 2
+    coefficients, _ = module.fit_regression(records[:index] + records[index + 1:])
+    x = module.regression_features(records[index]["x"])
+    for h, y in records[index]["curve"].items():
+        literal = y - sum(a * b for a, b in zip(x, coefficients[h - 1]))
+        if abs(literal - errors[index][h]) > 1e-8:
+            raise AssertionError((h, literal, errors[index][h]))
+
+
+def robustness_checks(final, temp, entry):
+    original, _, _ = run_entry(final, temp, entry)
+    minute_only = copy.deepcopy(final)
+    minute_only["history_hourly"] = None
+    minute_prediction, _, _ = run_entry(minute_only, temp, entry)
+    if minute_prediction != original:
+        raise AssertionError("minute aggregation disagrees with exact hourly means")
+    # Odd inputs must produce the same valid persistence fallback shape.
+    probes = ["{broken JSON", "null", json.dumps({"known": [{"hour": 1, "viewers": 1e300}]}),
+              json.dumps({"day_start": "bad timestamp", "known": [{"hour": 1, "viewers": 12345}]}),
+              json.dumps({"day_start": final["day_start"], "known": [{"hour": 1, "viewers": 0}],
+                          "history": [{"at": None, "viewers": None}], "comparables": [None]})]
+    for raw in probes:
+        run_entry({"id": "odd_input"}, temp, entry, raw=raw)
+    pred, _, _ = run_entry({"id": "preserve_print"}, temp, entry, raw=probes[3])
+    if pred != persistence(12345):
+        raise AssertionError("fallback lost the available hour-1 print")
+    input_dir, output_dir = temp / "input", temp / "output"
+    for path in input_dir.glob("*.in"):
+        path.unlink()
+    for path in output_dir.glob("*.out"):
+        path.unlink()
+    # A broken first file must not prevent later files from being processed.
+    payloads = {"z_valid": json.dumps({"known": [{"hour": 1, "viewers": 23456}]}),
+                "a_invalid": "invalid JSON", "m_valid": json.dumps({"known": [{"hour": 1, "viewers": 34567}]})}
+    for name, raw in payloads.items():
+        (input_dir / (name + ".in")).write_text(raw)
+    invoke_entry(input_dir, output_dir, entry)
+    if sorted(p.stem for p in output_dir.glob("*.out")) != sorted(payloads):
+        raise AssertionError("batch did not process every input")
+    for name, p in (("a_invalid", 1), ("m_valid", 34567), ("z_valid", 23456)):
+        if validate((output_dir / (name + ".out")).read_bytes()) != persistence(p):
+            raise AssertionError(f"batch fallback mismatch: {name}")
+    invalid, _, _, valid, _ = grade_entry(final, temp, Path(os.devnull))
+    p = final["known"][0]["viewers"]
+    if valid or invalid != {h: [p] * 5 for h in range(2, 25)}:
+        raise AssertionError("grader did not assign the specified invalid-output penalty")
+    return len(probes)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kit", type=Path, default=ROOT.parent / "gta6-twitch-ccu-forecast-01-kit")
     parser.add_argument("--entry", type=Path, default=ROOT / "main.py")
-    parser.add_argument("--answers", type=Path)
+    parser.add_argument("--answers", type=Path, help="labels from fetch_practice.py (default: its /tmp cache)")
     parser.add_argument("--details", action="store_true")
     parser.add_argument("--report", type=Path, help="optional JSON results; keep outside the repo")
     args = parser.parse_args()
@@ -250,22 +353,31 @@ def main():
     practices = [json.loads(p.read_text()) for p in sorted((args.kit / "input").glob("p*.in"))]
     if len(practices) != 4:
         raise ValueError("expected four practice cases")
-    answers = load_answers(args.answers)
+    answer_path = args.answers
+    if answer_path is None and Path("/tmp/gta-practice-answers.json").is_file():
+        answer_path = Path("/tmp/gta-practice-answers.json")
+    answers = load_answers(answer_path)
     launches = practices[0]["comparables"]
+    press_checked = args.entry.resolve() == (ROOT / "main.py").resolve()
+    if press_checked:
+        check_press(args.entry, launches)
     report = {"practice": [], "loo": [], "skipped": []}
     print(f"{'case / set':30} {'loss':>12} {'baseline':>10} {'miss':>9} {'90% cover':>10} {'run ms':>8}")
     with tempfile.TemporaryDirectory(prefix="gta-backtest-") as directory:
         temp = Path(directory)
         for case in practices:
-            pred, elapsed, data = run_entry(case, temp, args.entry)
-            pred2, elapsed2, data2 = run_entry(case, temp, args.entry)
-            if data != data2:
-                raise ValueError(f"{case['id']} is nondeterministic")
+            pred, elapsed, data, valid, error = grade_entry(case, temp, args.entry)
+            _, elapsed2, data2, valid2, error2 = grade_entry(case, temp, args.entry)
+            deterministic = valid and valid2 and data == data2
             truth = answers.get(case["id"])
             model = score(pred, truth) if truth else None
             house = score(persistence(case["known"][0]["viewers"]), truth) if truth else None
-            print_row(case["id"] + " " + case["game"]["name"][:23], model, house, elapsed)
-            report["practice"].append({"id": case["id"], "model": model, "baseline": house, "seconds": max(elapsed, elapsed2)})
+            label = case["id"] + " " + case["game"]["name"][:23]
+            print_row(label, model, house, elapsed)
+            if not valid or not valid2 or not deterministic:
+                print(f"  INVALID / UNRANKED: {error or error2 or 'nondeterministic output'}")
+            report["practice"].append({"id": case["id"], "model": model, "baseline": house,
+                "seconds": max(elapsed, elapsed2), "valid": valid and valid2, "deterministic": deterministic})
         pmodel = aggregate([r["model"] for r in report["practice"] if r["model"]])
         phouse = aggregate([r["baseline"] for r in report["practice"] if r["baseline"]])
         print_row("PRACTICE mean", pmodel, phouse, sum(r["seconds"] for r in report["practice"]) / 4)
@@ -278,19 +390,21 @@ def main():
                 continue
             case, truth = result
             assert all(a["name"] != launch["name"] for a in case["comparables"])
-            pred, elapsed, _ = run_entry(case, temp, args.entry)
+            pred, elapsed, _, valid, error = grade_entry(case, temp, args.entry)
             model = score(pred, truth)
             house = score(persistence(case["known"][0]["viewers"]), truth)
             row = {"name": launch["name"], "gta_like": gta_like(launch), "model": model,
-                   "baseline": house, "seconds": elapsed}
+                   "console_only": console_only(launch), "baseline": house, "seconds": elapsed,
+                   "valid": valid, "error": error}
             report["loo"].append(row)
             if args.details:
                 print_row(("* " if row["gta_like"] else "  ") + launch["name"][:28], model, house, elapsed)
         for label, rows in (("LOO all", report["loo"]),
-                            ("LOO console / rolling", [r for r in report["loo"] if r["gta_like"]])):
+                            ("LOO console / rolling", [r for r in report["loo"] if r["gta_like"]]),
+                            ("LOO console-only / rolling", [r for r in report["loo"] if r["gta_like"] and r["console_only"]])):
             print_row(f"{label} (n={len(rows)})", aggregate([r["model"] for r in rows]),
                       aggregate([r["baseline"] for r in rows]), statistics.mean(r["seconds"] for r in rows))
-        final = final_shape(practices, launches)
+        final = final_shape(practices, launches, answers)
         _, elapsed, data = run_entry(final, temp, args.entry)
         _, elapsed2, data2 = run_entry(final, temp, args.entry)
         if data != data2:
@@ -300,12 +414,25 @@ def main():
                                  "comparables": len(final["comparables"])}
         print(f"Final shape: valid, deterministic, {max(elapsed, elapsed2):.3f}s, {len(data)} bytes; "
               f"{len(final['history'])} minute reads, {len(final['comparables'])} comparables")
+        if press_checked:
+            probes = robustness_checks(final, temp, args.entry)
+            report["robustness"] = {"odd_inputs_valid": probes, "minute_hourly_equivalent": True,
+                                     "press_verified": True, "batch_valid": True}
+            print(f"Robustness: {probes} odd inputs valid; batch valid; minute/hourly aggregation agrees; "
+                  "PRESS matches literal LOO")
+        report["valid"] = all(r["valid"] for r in report["practice"] + report["loo"])
+        report["deterministic"] = all(r["deterministic"] for r in report["practice"])
+        print(f"Valid: {int(report['valid'])}; deterministic practice/final: {int(report['deterministic'])}")
     if report["skipped"]:
         print("Skipped (missing hour 1 or <12 answer hours):", ", ".join(report["skipped"]))
     if not all(r["model"] for r in report["practice"]):
         print("Practice scores INCOMPLETE: supply --answers; no labels were inferred.")
     if args.report:
         args.report.write_text(json.dumps(report, indent=2) + "\n")
+    if not all(r["model"] for r in report["practice"]):
+        raise SystemExit(2)
+    if not report["valid"] or not report["deterministic"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

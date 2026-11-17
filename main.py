@@ -1,14 +1,31 @@
-"""Conditional launch analogs; Python standard library, with a persistence fallback."""
+"""Fit log launch curves, then calibrate quantiles with held-out analog errors.
+
+Features use only pre-checkpoint observations. Quantile residuals are computed
+by leave-one-out within the supplied training pool; the benchmark holds out an
+additional entire launch. Streams and category ranks have no historical labels,
+so they are accepted without inventing a forecasting effect for them.
+"""
 
 import json
 import math
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
 
 LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
+RIDGE = 3.0
+FEATURE_SET = "activity"
+RESIDUAL_POOL = 0.25
+RESIDUAL_SCALE = 0.85
+REGIME = False
+SPARSE_MODE = True
+# Saturating scale protects a record-sized launch from extrapolated decay.
+LOGP_CAP = 13.0
+SPARSE_SPREAD = .45
+SPARSE_JITTER = True
 
 
 def timestamp(value):
@@ -32,8 +49,8 @@ def first_print(case):
 
 def baseline(p):
     return {"hours": [
-        {"hour": h, "q": [min(1e9, max(0.01, round(
-            p * math.exp(z * 0.15 * math.sqrt(h - 1)), 2))) for z in Z]}
+        {"hour": h, "q": [min(1e9, max(0.01, math.floor(
+            p * math.exp(z * 0.15 * math.sqrt(h - 1)) * 100 + .5) / 100)) for z in Z]}
         for h in range(2, 25)
     ]}
 
@@ -75,13 +92,19 @@ def features(points, p, meta):
         values = [v[0] for k, v in points.items() if lo <= k < hi]
         return math.log(max(1.0, sum(values) / len(values)) / p) if values else 0.0
 
+    channel = points.get(0, (p, None))[1]
+    logc = math.log(max(1, channel)) if channel is not None else math.log(p) - 4
+    peaks = [v[0] for k, v in points.items() if -24 <= k < 0]
+    peak = math.log(max(peaks) / p) if peaks else 0.0
     return (math.log(p), ratio(-24, 0), ratio(-6, 0), ratio(-2, 0),
-            ratio(-72, -24), *meta)
+            ratio(-72, -24), *meta, logc, peak)
 
 
 def comparable_records(case):
     records = []
     for item in case.get("comparables", []) or []:
+        if not isinstance(item, dict):
+            continue
         try:
             if "target-history" in item.get("unlock", "") or "not a launch" in item.get("unlock", "").lower():
                 continue
@@ -91,8 +114,12 @@ def comparable_records(case):
                 continue
             p = points[0][0]
             meta = metadata(item.get("unlock", ""), item.get("platforms", ""))
+            launch_points = {h: v for h, v in points.items() if 0 <= h <= 23}
+            peak = max(v[0] for v in launch_points.values())
+            onset = next((h for h, v in sorted(launch_points.items()) if v[0] >= max(3 * p, .15 * peak)), 12)
             records.append({"name": item.get("name", ""), "x": features(points, p, meta),
-                            "curve": {h: math.log(v[0] / p) for h, v in points.items() if 1 <= h <= 23}})
+                            "curve": {h: math.log(v[0] / p) for h, v in points.items() if 1 <= h <= 23},
+                            "logs": {h: math.log(v[0]) for h, v in points.items()}, "onset": onset})
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
     return records
@@ -104,6 +131,59 @@ def weights(target, records):
                      for a, b, s in zip(target, row["x"], scales)) for row in records]
     closest = min(distances)
     return [math.exp(-0.5 * (d - closest)) for d in distances]
+
+
+def regression_features(x):
+    logp, day, recent, last, older, console, rolling, early, logc, peak = x
+    # A dormant category's first-hour print is not a measure of its eventual size.
+    # A hinge lets launch-day ratios vary rapidly below 10k, gently above it.
+    result = [1.0, (min(LOGP_CAP, logp) - 11) / 2, max(0.0, 9.2 - logp) / 2,
+            max(-3.0, day), max(-2.0, recent), last,
+            max(-6.0, older) / 3, console, rolling, early]
+    if FEATURE_SET in ("channels", "activity"):
+        result.extend([(logc - logp + 4) / 2, peak])
+    if FEATURE_SET == "activity":
+        result.append(float(is_sparse(x)))
+    return result
+
+
+def fit_regression(records):
+    dimension = len(regression_features(records[0]["x"]))
+    coefficients, residuals = [], [{} for _ in records]
+    for hour in range(1, 24):
+        indices = [i for i, r in enumerate(records) if hour in r["curve"]]
+        rows = [(regression_features(records[i]["x"]), records[i]["curve"][hour]) for i in indices]
+        matrix = [[sum(x[i] * x[j] for x, _ in rows) + (RIDGE if i == j and i else 0.0)
+                   for j in range(dimension)] + [float(i == j) for j in range(dimension)]
+                  for i in range(dimension)]
+        for i in range(dimension):
+            pivot = max(range(i, dimension), key=lambda j: abs(matrix[j][i]))
+            matrix[i], matrix[pivot] = matrix[pivot], matrix[i]
+            divisor = matrix[i][i]
+            if abs(divisor) < 1e-10:
+                raise ValueError("singular fit")
+            matrix[i] = [v / divisor for v in matrix[i]]
+            for j in range(dimension):
+                if j != i:
+                    factor = matrix[j][i]
+                    matrix[j] = [a - factor * b for a, b in zip(matrix[j], matrix[i])]
+        inverse = [row[dimension:] for row in matrix]
+        xy = [sum(x[i] * y for x, y in rows) for i in range(dimension)]
+        beta = [sum(a * b for a, b in zip(row, xy)) for row in inverse]
+        coefficients.append(beta)
+        # PRESS identity: these are exact leave-one-out errors for fixed ridge.
+        for index, (x, y) in zip(indices, rows):
+            leverage = sum(x[i] * sum(a * b for a, b in zip(row, x)) for i, row in enumerate(inverse))
+            fitted = sum(a * b for a, b in zip(x, beta))
+            residuals[index][hour] = (y - fitted) / max(1e-6, 1 - leverage)
+    return coefficients, residuals
+
+
+def regression_predictions(records, target):
+    coefficients, residuals = fit_regression(records)
+    x = regression_features(target)
+    center = [sum(a * b for a, b in zip(x, beta)) for beta in coefficients]
+    return center, residuals
 
 
 def mixture_quantiles(values, masses, spread):
@@ -125,6 +205,40 @@ def mixture_quantiles(values, masses, spread):
     return result
 
 
+def is_sparse(x):
+    return x[0] < math.log(15000) and x[8] < math.log(200) and x[5] == 0 and x[7] == 0
+
+
+def sparse_forecast(case, records, target):
+    """Before a global unlock, borrow audience levels rather than huge ratios."""
+    donors = [r for r in records if is_sparse(r["x"])]
+    if len(donors) < 4:
+        return None
+    text = case.get("notes", "").lower().split("source:")[0]
+    declared = None
+    # Do not use unlock times that were inferred retrospectively from the answer.
+    if "inferred" not in text and "unverified" not in text:
+        times = re.findall(re.escape(case["day_start"][:10]) + r"t(\d{2}):", text)
+        if times:
+            declared = int(times[0])
+    result = []
+    for h in range(1, 24):
+        values, masses = [], []
+        for donor in donors:
+            shifts = [(donor["onset"] - declared, 1.0)] if declared is not None else (
+                [(-4, .1), (-2, .2), (0, .4), (2, .2), (4, .1)] if SPARSE_JITTER else [(0, 1.0)])
+            for shift, weight in shifts:
+                logs = donor["logs"]
+                offset = h + shift
+                nearest = min(logs, key=lambda k: abs(k - offset))
+                base = min(logs, key=lambda k: abs(k - shift))
+                maturity = min(1.0, max(0.0, (offset - donor["onset"] + 1) / 3))
+                values.append(logs[nearest] - target[0] + (1 - maturity) * (target[0] - logs[base]))
+                masses.append(weight)
+        result.append(mixture_quantiles(values, masses, SPARSE_SPREAD))
+    return result
+
+
 def forecast_case(case):
     p = first_print(case)
     start = timestamp(case["day_start"])
@@ -141,20 +255,26 @@ def forecast_case(case):
         meta = metadata(notes, platform_text)
     target = features(points, p, meta)
     records = comparable_records(case)
+    if REGIME:
+        same_regime = [r for r in records if is_sparse(r["x"]) == is_sparse(target)]
+        if len(same_regime) >= 6:
+            records = same_regime
     if len(records) < 3:
         return baseline(p)
+    if SPARSE_MODE and is_sparse(target):
+        sparse = sparse_forecast(case, records, target)
+        if sparse is not None:
+            return {"hours": [{"hour": h + 2, "q": [round(math.exp(min(math.log(1e9), max(-4.6, math.log(p) + v))), 4)
+                                                      for v in row]} for h, row in enumerate(sparse)]}
     masses = weights(target, records)
+    centers, residuals = regression_predictions(records, target)
     hours = []
     for hour in range(1, 24):
         values, local_weights = [], []
-        for record, weight in zip(records, masses):
+        for index, (record, weight) in enumerate(zip(records, masses)):
             if hour in record["curve"]:
-                # Smooth sampling noise, preserving the analog's launch structure.
-                curve = record["curve"]
-                neighbors = [(curve[k], 2 if k == hour else 1)
-                             for k in range(max(1, hour - 1), min(23, hour + 1) + 1) if k in curve]
-                values.append(sum(v * w for v, w in neighbors) / sum(w for _, w in neighbors))
-                local_weights.append(weight)
+                values.append(centers[hour - 1] + RESIDUAL_SCALE * residuals[index][hour])
+                local_weights.append(RESIDUAL_POOL / len(records) + (1 - RESIDUAL_POOL) * weight / sum(masses))
         if not values:
             hours.append(baseline(p)["hours"][hour - 1])
             continue
